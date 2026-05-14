@@ -38,7 +38,7 @@ export default function App() {
     
     return () => unsubscribe();
   }, []);
-  
+
   return (
     <div style={styles.app}>
       <header style={styles.header}>
