@@ -13,15 +13,31 @@ import {
   getDoc,
   getDocs,
   updateDoc,
+  addDoc,
   query,
   where,
   orderBy,
+  limit,
   runTransaction,
   serverTimestamp
 } from "firebase/firestore";
 import { db } from "../firebase";
 
 const GAS_WEB_APP_URL = import.meta.env.VITE_GAS_WEB_APP_URL;
+
+// ============================================
+// 7 階段定義 (跟 GAS Settings 對齊)
+// ============================================
+
+export const STAGE_DEFINITIONS = [
+  { number: 1, name: "找尋廠商" },
+  { number: 2, name: "郵件/社群聯繫" },
+  { number: 3, name: "邀請內部會議確認" },
+  { number: 4, name: "請廠商提供合約" },
+  { number: 5, name: "彙整給彥鈞的報告" },
+  { number: 6, name: "合約修正" },
+  { number: 7, name: "合約簽署中" }
+];
 
 // ============================================
 // vendor_id 產生器
@@ -160,6 +176,135 @@ export async function createVendor(vendorData) {
       success: false,
       error: error.message || String(error)
     };
+  }
+}
+
+// ============================================
+// 階段推進 (Y2 即時雙寫:Firestore 為主、GAS Sheets 為鏡像)
+// ============================================
+
+export async function advanceStage(vendorId, notes) {
+  try {
+    // 1. 讀取 Firestore vendor 文件
+    const vendorRef = doc(db, "vendors", vendorId);
+    const vendorSnap = await getDoc(vendorRef);
+
+    if (!vendorSnap.exists()) {
+      throw new Error("找不到廠商: " + vendorId);
+    }
+
+    const vendorDoc = vendorSnap.data();
+
+    if (vendorDoc.is_deleted === true) {
+      throw new Error("該廠商已刪除,無法推進階段");
+    }
+
+    // 2. 計算下一階段
+    const currentStageNumber = vendorDoc.stage_number;
+    const nextStageNumber = currentStageNumber + 1;
+
+    if (nextStageNumber > 7) {
+      throw new Error("已經是最後階段,無法再推進");
+    }
+
+    const nextStage = STAGE_DEFINITIONS.find(s => s.number === nextStageNumber);
+
+    // 3. 計算 days_in_stage:抓 stage_history 最後一筆的 changed_at
+    const historyCol = collection(db, "vendors", vendorId, "stage_history");
+    const lastHistoryQuery = query(
+      historyCol,
+      orderBy("changed_at", "desc"),
+      limit(1)
+    );
+    const lastHistorySnap = await getDocs(lastHistoryQuery);
+
+    let lastChangedAt;
+    if (!lastHistorySnap.empty) {
+      const lastData = lastHistorySnap.docs[0].data();
+      lastChangedAt = lastData.changed_at?.toDate
+        ? lastData.changed_at.toDate()
+        : lastData.changed_at;
+    } else {
+      // 理論上不會發生,createVendor 一定會寫一筆「新建」
+      lastChangedAt = vendorDoc.created_at?.toDate
+        ? vendorDoc.created_at.toDate()
+        : vendorDoc.created_at;
+    }
+
+    const daysInStage = Math.floor(
+      (Date.now() - lastChangedAt.getTime()) / (1000 * 60 * 60 * 24)
+    );
+
+    // 4. 準備寫入資料
+    const now = new Date();
+    const changedBy = "react-web"; // Phase 8 加 Auth 後改成真實使用者 email
+
+    // 5a. 更新 vendors 主檔
+    const vendorUpdate = {
+      stage: nextStage.name,
+      stage_number: nextStage.number,
+      updated_at: serverTimestamp()
+    };
+    if (nextStage.name === "合約簽署中") {
+      vendorUpdate.is_contracted = true;
+    }
+    await updateDoc(vendorRef, vendorUpdate);
+
+    // 5b. 寫 stage_history (若失敗,主檔已更新,先吞掉錯誤;實務上極少發生)
+    try {
+      await addDoc(historyCol, {
+        vendor_id: vendorId,
+        vendor_name: vendorDoc.vendor_name,
+        from_stage: vendorDoc.stage,
+        from_stage_number: currentStageNumber,
+        to_stage: nextStage.name,
+        to_stage_number: nextStage.number,
+        change_type: "前進",
+        changed_by: changedBy,
+        changed_at: serverTimestamp(),
+        notes: notes || ("推進至「" + nextStage.name + "」"),
+        days_in_stage: daysInStage
+      });
+    } catch (historyError) {
+      console.error(
+        "advanceStage: stage_history 寫入失敗 (主檔已更新成功):",
+        historyError
+      );
+    }
+
+    // 6. 同步呼叫 GAS Sheets 鏡像
+    const payload = {
+      vendor_id: vendorId,
+      vendor_name: vendorDoc.vendor_name,
+      from_stage: vendorDoc.stage,
+      from_stage_number: currentStageNumber,
+      to_stage: nextStage.name,
+      to_stage_number: nextStage.number,
+      changed_by: changedBy,
+      changed_at: now.toISOString(),
+      notes: notes || ("推進至「" + nextStage.name + "」"),
+      days_in_stage: daysInStage
+    };
+
+    const gasResult = await callGAS("advanceStage", { payload });
+
+    if (gasResult.success === false) {
+      console.warn("GAS Sheets 同步失敗:" + gasResult.error);
+    }
+
+    // 7. 回傳結果
+    return {
+      success: true,
+      vendor_id: vendorId,
+      from_stage: vendorDoc.stage,
+      to_stage: nextStage.name,
+      days_in_stage: daysInStage,
+      gas_synced: gasResult.success
+    };
+
+  } catch (error) {
+    console.error("advanceStage 錯誤:", error);
+    throw error;
   }
 }
 
